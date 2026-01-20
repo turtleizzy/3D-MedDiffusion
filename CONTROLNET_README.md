@@ -39,63 +39,114 @@ Ensure you are using the project's virtual environment:
 source .venv/bin/activate  # or use .venv/bin/python directly
 ```
 
-### A. Training (`train/train_ControlNet.py`)
+### A. Training Setup
 
-To fine-tune ControlNet on your data:
+The training process has been updated to support both 8x and 4x models, with optimizations for memory usage and multi-GPU training.
 
+#### 1. Training with 8x Model
+For the 8x model, you can train directly from raw images as the memory footprint is manageable.
+
+**Script:** `run_controlnet.sh`
 ```bash
-python train/train_ControlNet.py \
-  --data-path /path/to/MRBrain_data \
-  --results-dir results/controlnet_finetune \
+torchrun --nproc_per_node=4 train/train_ControlNet.py \
+  --data-path data/skullstrip/index.json \
+  --results-dir results/controlnet_train_8x \
   --pretrained-base-ckpt checkpoints/BiFlowNet_0453500.pt \
   --AE-ckpt checkpoints/PatchVolume_8x_s2.ckpt \
-  --batch-size 4 \
   --resolution 32 32 32 \
-  --num-workers 8
+  --patch-size 2 \
+  --batch-size 1 \
+  --num-workers 4 \
+  --epochs 100 \
+  --downsample-factor 8 \
+  --model-dim 72 \
+  --dim-mults 1 1 2 4 8 \
+  --use-attn 0 0 0 1 1 \
+  --volume-channels 8
 ```
 
-*   **Note**: `resolution` refers to the **latent** resolution. If your input images are 256x256x256 and you use the 8x AE, the latent resolution is 32x32x32.
+#### 2. Training with 4x Model (Optimized)
+Training the 4x model requires significantly more memory. To handle this, we use a two-step process: **pre-computing latents** and then **training on latents**.
+
+**Step 1: Pre-compute Latents**
+Run the preprocessing script to encode all images using the 4x AutoEncoder and save them to disk. This supports multi-GPU processing.
+
+```bash
+torchrun --nproc_per_node=4 preprocess_latents.py \
+  --data-path data/skullstrip/index.json \
+  --output-dir data/skullstrip/latents_4x \
+  --AE-ckpt checkpoints/PatchVolume4x_s2.ckpt \
+  --resolution 48 48 48 \
+  --downsample-factor 4
+```
+
+**Step 2: Train on Latents**
+Use the `run_controlnet_4x.sh` script which points to the pre-computed latents. This bypasses the AE during training, saving memory and time.
+
+```bash
+torchrun --nproc_per_node=4 train/train_ControlNet.py \
+  --data-path data/skullstrip/index.json \
+  --results-dir results/controlnet_train_4x \
+  --pretrained-base-ckpt checkpoints/BiFlowNet_4x.pt \
+  --AE-ckpt checkpoints/PatchVolume4x_s2.ckpt \
+  --latent-root data/skullstrip/latents_4x \
+  --resolution 48 48 48 \
+  --patch-size 2 \
+  --batch-size 1 \
+  --downsample-factor 4 \
+  ...
+```
+
+#### 3. Resuming Training
+You can resume training from a checkpoint using the `--ckpt` argument.
+
+**Script:** `run_controlnet_4x_resume.sh`
+```bash
+torchrun ... \
+  --ckpt results/controlnet_train_4x/000-ControlNet/checkpoints/0015000.pt
+```
 
 ### B. Inference (`inference_ControlNet.py`)
 
 To generate samples with specific Age/Sex conditions:
 
+**Validation Script:** `run_controlnet_val.sh` (matches 4x training resolution)
 ```bash
 python inference_ControlNet.py \
+  --base-ckpt checkpoints/BiFlowNet_4x.pt \
+  --control-ckpt results/controlnet_train_4x/005-ControlNet/checkpoints/0000100.pt \
+  --ae-ckpt checkpoints/PatchVolume4x_s2.ckpt \
+  --output-dir results/inference_controlnet_4x \
   --modality T1 \
-  --age 0.7 \
-  --sex 1.0 \
-  --base-ckpt checkpoints/BiFlowNet_0453500.pt \
-  --ae-ckpt checkpoints/PatchVolume_8x_s2.ckpt \
-  --output-dir results/inference \
-  --control-scale 1.0
+  --age 0.5 \
+  --sex 0.0 \
+  --resolution 48 48 48 \
+  --timesteps 100
 ```
-
-*   **Modality**: `T1` (Class 3) or `T2` (Class 4).
-*   **Controls**: `age` (0.0 to 1.0), `sex` (0.0 or 1.0).
 
 ## 3. Important Details & Notes
 
 1.  **Memory Management**:
-    *   3D volumes are memory-intensive. During inference, the script explicitly deletes the diffusion model and clears CUDA cache before running the AutoEncoder decoder to avoid OOM errors on 16GB GPUs.
-    *   If OOM persists, the decoding step falls back to CPU automatically.
+    *   **Pre-computation**: For 4x training, pre-computing latents is crucial to avoid OOM errors and speed up training.
+    *   **Distributed Training (DDP)**: Training scripts use `torchrun` for multi-GPU support. `DistributedSampler` ensures data is split correctly.
+    *   **Validation**: Validation sampling is only performed on Rank 1 (device 1) to save memory on the primary rank and avoid redundancy.
 
-2.  **Architecture Specifics**:
-    *   **Transformer vs CNN**: BiFlowNet is a hybrid. The ControlNet implementation respects this by handling both patch-based (Transformer) and voxel-based (CNN) features.
-    *   **Patch Unfolding**: The `ControlNet` replicates the `unfold`/`rearrange` logic of the base model to ensure patch alignment.
+2.  **Dataset Updates**:
+    *   `dataset/Control_dataset.py` now supports:
+        *   `latent_root`: Loading `.pt` latent files directly.
+        *   `downsample_factor`: Automatically calculating target image size based on latent resolution and factor (4 or 8).
+        *   Real metadata: Loads Age and Sex from `index.json`.
 
-3.  **Dataset**:
-    *   The current `Control_dataset.py` uses random values for Age/Sex. **Action Required**: Modify `dataset/Control_dataset.py` to load real metadata (e.g., from a CSV file matching filenames) for meaningful training.
-
-4.  **Weights**:
-    *   `BiFlowNet` weights must be loaded into the base model.
-    *   `ControlNet` weights are initialized from the base model weights (encoder only) at the start of training.
-    *   The saved checkpoints in `results/` contain **only** the ControlNet parameters to save space.
+3.  **Model Configuration**:
+    *   **8x**: Latent resolution 32x32x32 -> Image 256x256x256.
+    *   **4x**: Latent resolution 48x48x48 -> Image 192x192x192.
+    *   Ensure `resolution`, `patch-size`, and `downsample-factor` match the specific model (4x or 8x) you are using.
 
 ## 4. File Structure
 
 *   `ddpm/ControlNet.py`: Core logic for ControlNet and the wrapper.
-*   `train/train_ControlNet.py`: Training loop with freezing logic.
+*   `train/train_ControlNet.py`: Training loop with freezing logic, DDP, and latent support.
+*   `preprocess_latents.py`: Script to pre-compute latents for memory-efficient training.
 *   `inference_ControlNet.py`: Verification and generation script.
 *   `dataset/Control_dataset.py`: Dataset loader with Age/Sex channel generation.
-
+*   `run_controlnet*.sh`: Shell scripts for easy execution of training and validation tasks.
