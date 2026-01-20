@@ -145,6 +145,32 @@ def main(args):
 
     # We only optimize ControlNet
     opt = torch.optim.Adam(controlnet.parameters(), lr=1e-5)
+
+    # Resume from checkpoint if provided
+    if args.ckpt is not None:
+        if os.path.exists(args.ckpt):
+            logger.info(f"Resuming from checkpoint {args.ckpt}")
+            checkpoint = torch.load(args.ckpt, map_location='cpu')
+            
+            # Load ControlNet state
+            if 'controlnet' in checkpoint:
+                # We need to handle potential DDP prefix issues if saved with DDP but loading into non-DDP model (before wrapping)
+                # Current code saves model.module.controlnet.state_dict(), so keys should be clean.
+                controlnet.load_state_dict(checkpoint['controlnet'], strict=True)
+            else:
+                logger.warning("Checkpoint provided but 'controlnet' state dict missing!")
+                
+            # Load Optimizer state
+            if 'opt' in checkpoint:
+                opt.load_state_dict(checkpoint['opt'])
+                
+            # Load Epoch/Step info
+            if 'epoch' in checkpoint:
+                start_epoch = checkpoint['epoch'] + 1
+                logger.info(f"Resuming at epoch {start_epoch}")
+            
+        else:
+            logger.warning(f"Checkpoint {args.ckpt} not found! Starting from scratch.")
     
     # DDP Wrapper
     model = DDP(model, device_ids=[rank], find_unused_parameters=False)

@@ -7,12 +7,13 @@ source .venv/bin/activate
 # Patch size 1 for 8x model
 
 .venv/bin/python inference_ControlNet.py \
-  --base-ckpt checkpoints/BiFlowNet_0453500.pt \
-  --control-ckpt results/controlnet_train_8x/007-ControlNet/checkpoints/0015000.pt \
-  --ae-ckpt checkpoints/PatchVolume_8x_s2.ckpt \
-  --output-dir results/inference_controlnet_8x \
+  --base-ckpt checkpoints/BiFlowNet_4x.pt \
+  --control-ckpt results/controlnet_train_4x/000-ControlNet/checkpoints/0005000.pt \
+  --ae-ckpt checkpoints/PatchVolume4x_s2.ckpt \
+  --output-dir results/inference_controlnet_4x \
   --modality T1 \
   --age 0.8 \
   --sex 0.0 \
-  --resolution 24 24 24 \
+  --resolution 48 48 48 \
+  --patch-size 2 \
   --timesteps 1000
