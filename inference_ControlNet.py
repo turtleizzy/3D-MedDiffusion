@@ -14,7 +14,78 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.abspath(os.path.join(current_dir, ".."))
 sys.path.append(project_root)
 
+def load_and_encode_nifti(nifti_path, AE, target_resolution, downsample_factor, device):
+    """
+    Load a NIfTI file and encode it to latent space using the AutoEncoder.
+    
+    Args:
+        nifti_path: Path to the input NIfTI file
+        AE: AutoEncoder model
+        target_resolution: Target latent resolution [D, H, W]
+        downsample_factor: AE downsample factor (4 or 8)
+        device: Device to use for encoding
+        
+    Returns:
+        latent: Encoded latent tensor (1, C, D, H, W)
+    """
+    print(f"Loading input NIfTI: {nifti_path}")
+    
+    # Calculate target image size from latent resolution
+    target_image_size = tuple([r * downsample_factor for r in target_resolution])
+    
+    # Load and preprocess image
+    img = tio.ScalarImage(nifti_path)
+    transform = tio.CropOrPad(target_image_size)
+    img = transform(img)
+    data = img.data.to(torch.float32)
+    
+    # Normalize to [-1, 1]
+    d_min = data.min()
+    d_max = data.max()
+    if d_max > d_min:
+        data = (data - d_min) / (d_max - d_min) * 2.0 - 1.0
+    else:
+        data = torch.zeros_like(data)
+    
+    # Transpose dimensions to match AE expectation (C, D, H, W)
+    # Assuming input is (C, W, H, D) from tio
+    data = data.transpose(1, 3).transpose(2, 3)
+    # Ensure data is on the same device as AE
+    # AE might be on a different device (e.g. cuda:1) than ddpm_device (cuda:0)
+    # We should move data to AE's device for encoding
+    ae_device = next(AE.parameters()).device
+    data = data.unsqueeze(0).to(ae_device)  # Add batch dimension
+    
+    print(f"Input image shape (after preprocessing): {data.shape}")
+    
+    # Encode to latent
+    with torch.no_grad():
+        embeddings, _ = AE.encode(data, include_embeddings=True, quantize=True)
+        # Normalize embeddings to [-1, 1]
+        min_val = AE.codebook.embeddings.min()
+        max_val = AE.codebook.embeddings.max()
+        latent = (embeddings - min_val) / (max_val - min_val) * 2.0 - 1.0
+    
+    # Move latent back to target device (ddpm_device)
+    latent = latent.to(device)
+    
+    print(f"Encoded latent shape: {latent.shape}")
+    print(f"Encoded latent range: [{latent.min():.4f}, {latent.max():.4f}]")
+    
+    return latent
+
 def load_models(args, ddpm_device, decoder_device):
+    # Calculate control channels based on whether noisy latent control is used
+    # Use noisy latent control if: 1) explicitly enabled, or 2) input is provided
+    use_noisy_latent = args.use_noisy_latent_control or args.input_nifti or args.input_latent
+    
+    control_channels = 2  # age + sex
+    if use_noisy_latent:
+        control_channels += args.volume_channels
+        print(f"Using noisy latent control. Control channels: {control_channels}")
+    else:
+        print(f"Using age/sex only control. Control channels: {control_channels}")
+    
     # 1. Base Model
     print("Loading Base Model...")
     base_model = BiFlowNet(
@@ -44,7 +115,7 @@ def load_models(args, ddpm_device, decoder_device):
 
     # 2. ControlNet
     print("Loading ControlNet...")
-    controlnet = ControlNet(base_model, control_channels=2).to(ddpm_device)
+    controlnet = ControlNet(base_model, control_channels=control_channels).to(ddpm_device)
     
     # Load ControlNet Weights (if provided)
     if args.control_ckpt and os.path.exists(args.control_ckpt):
@@ -107,18 +178,60 @@ def generate(args):
     # args.resolution is latent resolution
     volume_size = args.resolution
     
-    # Random noise
+    # Random noise for diffusion sampling
     z = torch.randn(1, args.volume_channels, volume_size[0], volume_size[1], volume_size[2], device=ddpm_device)
     
     # Resolution embedding
     res = torch.tensor(volume_size, device=ddpm_device)/64.0
     
-    # Control Condition
-    # Age: normalized 0-1 (e.g., age/100)
-    # Sex: 0 or 1
-    control = torch.zeros((1, 2, volume_size[0], volume_size[1], volume_size[2]), device=ddpm_device)
-    control[:, 0] = args.age
-    control[:, 1] = args.sex
+    # Load input latent if provided (from NIfTI or pre-computed latent)
+    input_latent = None
+    if args.input_nifti:
+        # Calculate downsample factor from resolution
+        # 4x: resolution 48 -> image 192, 8x: resolution 24/32 -> image 192/256
+        downsample_factor = args.downsample_factor
+        input_latent = load_and_encode_nifti(
+            args.input_nifti, AE, volume_size, downsample_factor, ddpm_device
+        )
+    elif args.input_latent:
+        print(f"Loading input latent: {args.input_latent}")
+        input_latent = torch.load(args.input_latent).unsqueeze(0).to(ddpm_device)
+        print(f"Input latent shape: {input_latent.shape}")
+    
+    # Build Control Condition
+    # Determine if using noisy latent control mode
+    use_noisy_latent = args.use_noisy_latent_control or args.input_nifti or args.input_latent
+    
+    if use_noisy_latent:
+        # Create control with age, sex, and noisy latent
+        control_channels = 2 + args.volume_channels
+        control = torch.zeros((1, control_channels, volume_size[0], volume_size[1], volume_size[2]), device=ddpm_device)
+        control[:, 0] = args.age
+        control[:, 1] = args.sex
+        
+        if input_latent is not None:
+            # Add gaussian noise to input latent
+            noise_strength = args.noise_strength
+            gaussian_noise = torch.randn_like(input_latent) * noise_strength
+            noisy_latent = input_latent + gaussian_noise
+            print(f"Using input latent with noise_strength={noise_strength}")
+        else:
+            # No input provided, use pure random noise as noisy latent
+            # This is useful for unconditional generation with noisy latent control model
+            noise_strength = args.noise_strength
+            noisy_latent = torch.randn(1, args.volume_channels, volume_size[0], volume_size[1], volume_size[2], device=ddpm_device) * noise_strength
+            print(f"No input latent provided, using random noise with strength={noise_strength}")
+        
+        control[:, 2:] = noisy_latent
+        
+        print(f"Control shape: {control.shape}")
+        print(f"Noisy latent range: [{noisy_latent.min():.4f}, {noisy_latent.max():.4f}]")
+    else:
+        # Original behavior: age + sex only
+        control = torch.zeros((1, 2, volume_size[0], volume_size[1], volume_size[2]), device=ddpm_device)
+        control[:, 0] = args.age
+        control[:, 1] = args.sex
+        print(f"Control shape: {control.shape} (age/sex only)")
     
     # Sampling
     with torch.no_grad():
@@ -153,7 +266,18 @@ def generate(args):
         # Rearrange to correct orientation if needed (based on train script)
         volume = volume.transpose(1,3).transpose(1,2)
         
-        output_filename = f"output_{args.modality}_age{args.age}_sex{args.sex}.nii.gz"
+        # Convert from [-1, 1] to [0, 1] for proper visualization
+        # AE was trained with input normalized to [-1, 1], so output is also in that range
+        volume = (volume + 1.0) / 2.0
+        # Clamp to [0, 1] to handle any small overshoots
+        volume = torch.clamp(volume, 0, 1)
+        
+        # Generate output filename
+        if args.input_nifti or args.input_latent:
+            input_name = os.path.basename(args.input_nifti or args.input_latent).split('.')[0]
+            output_filename = f"output_{args.modality}_age{args.age}_sex{args.sex}_noise{args.noise_strength}_{input_name}.nii.gz"
+        else:
+            output_filename = f"output_{args.modality}_age{args.age}_sex{args.sex}.nii.gz"
         save_path = os.path.join(args.output_dir, output_filename)
         os.makedirs(args.output_dir, exist_ok=True)
         
@@ -172,6 +296,18 @@ if __name__ == "__main__":
     parser.add_argument("--age", type=float, default=0.5, help="Normalized Age (0-1)")
     parser.add_argument("--sex", type=float, default=0.0, help="Sex (0 or 1)")
     parser.add_argument("--control-scale", type=float, default=1.0)
+    
+    # Noisy latent control params
+    parser.add_argument("--use-noisy-latent-control", action='store_true',
+                        help="Use noisy latent control mode (required if checkpoint was trained with this)")
+    parser.add_argument("--input-nifti", type=str, default=None, 
+                        help="Optional input NIfTI file to encode as noisy latent control")
+    parser.add_argument("--input-latent", type=str, default=None,
+                        help="Optional pre-computed latent file (.pt) as noisy latent control")
+    parser.add_argument("--noise-strength", type=float, default=0.5,
+                        help="Gaussian noise strength to add to input latent (default: 0.5)")
+    parser.add_argument("--downsample-factor", type=int, default=4,
+                        help="AE downsample factor (4 or 8), used when encoding input NIfTI")
     
     # Model config (should match training)
     parser.add_argument("--model-dim", type=int, default=72)

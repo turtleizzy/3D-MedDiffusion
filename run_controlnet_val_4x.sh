@@ -8,11 +8,11 @@ source .venv/bin/activate
 
 .venv/bin/python inference_ControlNet.py \
   --base-ckpt checkpoints/BiFlowNet_4x.pt \
-  --control-ckpt results/controlnet_train_4x/000-ControlNet/checkpoints/0005000.pt \
+  --control-ckpt results/controlnet_train_4x/000-ControlNet/checkpoints/0008000.pt \
   --ae-ckpt checkpoints/PatchVolume4x_s2.ckpt \
   --output-dir results/inference_controlnet_4x \
   --modality T1 \
-  --age 0.8 \
+  --age 0.2 \
   --sex 0.0 \
   --resolution 48 48 48 \
   --patch-size 2 \
