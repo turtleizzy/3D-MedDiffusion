@@ -215,17 +215,14 @@ def generate(args):
             gaussian_noise = torch.randn_like(input_latent) * noise_strength
             noisy_latent = input_latent + gaussian_noise
             print(f"Using input latent with noise_strength={noise_strength}")
+            control[:, 2:] = noisy_latent
+            print(f"Control shape: {control.shape}")
+            print(f"Noisy latent range: [{noisy_latent.min():.4f}, {noisy_latent.max():.4f}]")
         else:
-            # No input provided, use pure random noise as noisy latent
-            # This is useful for unconditional generation with noisy latent control model
-            noise_strength = args.noise_strength
-            noisy_latent = torch.randn(1, args.volume_channels, volume_size[0], volume_size[1], volume_size[2], device=ddpm_device) * noise_strength
-            print(f"No input latent provided, using random noise with strength={noise_strength}")
+            # No input provided, use zeros for latent channels
+            # control[:, 2:] is already zeros, no need to modify
+            print(f"No input latent provided, using zeros for latent channels")
         
-        control[:, 2:] = noisy_latent
-        
-        print(f"Control shape: {control.shape}")
-        print(f"Noisy latent range: [{noisy_latent.min():.4f}, {noisy_latent.max():.4f}]")
     else:
         # Original behavior: age + sex only
         control = torch.zeros((1, 2, volume_size[0], volume_size[1], volume_size[2]), device=ddpm_device)

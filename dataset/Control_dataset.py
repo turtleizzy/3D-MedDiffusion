@@ -9,7 +9,8 @@ import torchio as tio
 class Control_dataset(Singleres_dataset):
     def __init__(self, root_dir=None, resolution=[32,32,32], generate_latents=False, 
                  downsample_factor=8, latent_root=None, volume_channels=8,
-                 use_noisy_latent_control=False, max_noise_strength=1.0):
+                 use_noisy_latent_control=False, max_noise_strength=1.0,
+                 full_noise_prob=0.0):
         """
         Args:
             root_dir: Path to index.json or directory containing it
@@ -20,6 +21,7 @@ class Control_dataset(Singleres_dataset):
             volume_channels: Number of latent channels (default 8)
             use_noisy_latent_control: Whether to include noisy latent as control
             max_noise_strength: Maximum noise strength for random noise injection
+            full_noise_prob: Probability of using zeros instead of noisy latent (0.0-1.0)
         """
         # super().__init__(root_dir=None, resolution=resolution, generate_latents=generate_latents)
         
@@ -32,6 +34,7 @@ class Control_dataset(Singleres_dataset):
         self.volume_channels = volume_channels
         self.use_noisy_latent_control = use_noisy_latent_control
         self.max_noise_strength = max_noise_strength
+        self.full_noise_prob = full_noise_prob
         
         # Calculate target image size
         self.target_image_size = tuple([r * self.downsample_factor for r in resolution])
@@ -49,7 +52,7 @@ class Control_dataset(Singleres_dataset):
             data = json.load(f)
             
         print(f"Loading data from {json_path}...")
-        print(f"Control settings: use_noisy_latent_control={use_noisy_latent_control}, max_noise_strength={max_noise_strength}")
+        print(f"Control settings: use_noisy_latent_control={use_noisy_latent_control}, max_noise_strength={max_noise_strength}, full_noise_prob={full_noise_prob}")
         
         for entry in data:
             study_uid = entry.get('studyUID')
@@ -103,13 +106,42 @@ class Control_dataset(Singleres_dataset):
             # Load pre-computed latent
             original_name = os.path.basename(path)
             stem = original_name.replace('.nii.gz', '').replace('.nii', '')
+            
+            # First try to find original latent
             latent_path = os.path.join(self.latent_root, f"{stem}.pt")
             
+            # If original not found, try to find augmented versions
             if not os.path.exists(latent_path):
-                raise FileNotFoundError(f"Latent file not found: {latent_path}")
+                # Look for augmented latents: {stem}_aug*.pt
+                aug_pattern = os.path.join(self.latent_root, f"{stem}_aug*.pt")
+                aug_files = glob.glob(aug_pattern)
+                
+                if len(aug_files) > 0:
+                    # Randomly select one augmented version
+                    latent_path = np.random.choice(aug_files)
+                else:
+                    raise FileNotFoundError(f"Latent file not found: {latent_path} (also checked augmented versions)")
+            else:
+                # Original exists, but if augmented versions also exist, randomly choose between original and augmented
+                aug_pattern = os.path.join(self.latent_root, f"{stem}_aug*.pt")
+                aug_files = glob.glob(aug_pattern)
+                
+                if len(aug_files) > 0:
+                    # Randomly choose between original and augmented versions
+                    all_options = [latent_path] + aug_files
+                    latent_path = np.random.choice(all_options)
                 
             data = torch.load(latent_path)
             # data is (C, D, H, W). For 4x model (volume_channels, 48, 48, 48)
+            
+            # Verify and fix dimensions if needed
+            expected_shape = (self.volume_channels, self.resolution[0], self.resolution[1], self.resolution[2])
+            if data.shape != expected_shape:
+                # Resize to expected shape using interpolation
+                from torch.nn.functional import interpolate
+                data = data.unsqueeze(0)  # (1, C, D, H, W)
+                data = interpolate(data, size=self.resolution, mode='trilinear', align_corners=False)
+                data = data.squeeze(0)  # (C, D, H, W)
             
             # Create control tensor
             control = self._create_control(age, sex, data)
@@ -153,8 +185,8 @@ class Control_dataset(Singleres_dataset):
         """
         D, H, W = self.resolution
         
-        if self.use_noisy_latent_control and latent is not None:
-            # Create control with age, sex, and noisy latent
+        if self.use_noisy_latent_control:
+            # Create control with age, sex, and noisy latent (or zeros if no latent)
             # Shape: (2 + volume_channels, D, H, W)
             control = torch.zeros((self.control_channels, D, H, W), dtype=torch.float32)
             
@@ -162,15 +194,26 @@ class Control_dataset(Singleres_dataset):
             control[0] = age
             control[1] = sex
             
-            # Randomly sample noise strength for this sample
-            noise_strength = torch.rand(1).item() * self.max_noise_strength
-            
-            # Create noisy latent: latent + noise_strength * gaussian_noise
-            gaussian_noise = torch.randn_like(latent)
-            noisy_latent = latent + noise_strength * gaussian_noise
-            
-            # Fill noisy latent channels
-            control[2:] = noisy_latent
+            if latent is not None:
+                # With full_noise_prob probability, use zeros instead of noisy latent
+                if torch.rand(1).item() < self.full_noise_prob:
+                    # Use zeros for latent channels
+                    # control[2:] is already zeros, no need to modify
+                    pass
+                else:
+                    # Randomly sample noise strength for this sample
+                    noise_strength = torch.rand(1).item() * self.max_noise_strength
+                    
+                    # Create noisy latent: latent + noise_strength * gaussian_noise
+                    gaussian_noise = torch.randn_like(latent)
+                    noisy_latent = latent + noise_strength * gaussian_noise
+                    
+                    # Fill noisy latent channels
+                    control[2:] = noisy_latent
+            else:
+                # No latent provided, use zeros for latent channels
+                # control[2:] is already zeros, no need to modify
+                pass
             
         else:
             # Original behavior: only age and sex

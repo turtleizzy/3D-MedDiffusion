@@ -209,6 +209,10 @@ def main(args):
     # We only optimize ControlNet
     opt = torch.optim.Adam(controlnet.parameters(), lr=1e-5)
 
+    # Initialize scaler before resume (needed for loading scaler state)
+    amp = args.enable_amp
+    scaler = GradScaler(enabled=amp)
+
     # Resume from checkpoint if provided
     if args.ckpt is not None:
         if os.path.exists(args.ckpt):
@@ -226,6 +230,16 @@ def main(args):
             # Load Optimizer state
             if 'opt' in checkpoint:
                 opt.load_state_dict(checkpoint['opt'])
+                logger.info("Loaded optimizer state from checkpoint")
+            else:
+                logger.warning("Checkpoint provided but 'opt' state dict missing!")
+            
+            # Load Scaler state (for AMP)
+            if 'scaler' in checkpoint:
+                scaler.load_state_dict(checkpoint['scaler'])
+                logger.info("Loaded scaler state from checkpoint")
+            else:
+                logger.info("No scaler state in checkpoint (may be from older version or non-AMP training)")
                 
             # Load Epoch/Step info
             if 'epoch' in checkpoint:
@@ -251,9 +265,6 @@ def main(args):
     
     # DDP Wrapper
     model = DDP(model, device_ids=[rank], find_unused_parameters=False)
-
-    amp = args.enable_amp
-    scaler = GradScaler(enabled=amp)
     
     AE = None
     if args.AE_ckpt and args.latent_root is None:
@@ -276,7 +287,8 @@ def main(args):
         latent_root=args.latent_root,
         volume_channels=args.volume_channels,
         use_noisy_latent_control=args.use_noisy_latent_control,
-        max_noise_strength=args.max_noise_strength
+        max_noise_strength=args.max_noise_strength,
+        full_noise_prob=getattr(args, 'full_noise_prob', 0.0)
     )
     
     # Verify data shapes if requested
@@ -296,7 +308,14 @@ def main(args):
 
     model.train()
     
+    # Track checkpoint cycles
+    ckpt_cycles = getattr(args, 'ckpt_cycles', None)  # Number of ckpt cycles to train
+    ckpt_cycle_count = 0  # Current cycle count
+    
     logger.info(f"Training for {args.epochs} epochs...")
+    if ckpt_cycles is not None:
+        logger.info(f"Will train for {ckpt_cycles} checkpoint cycles (every {args.ckpt_every} steps)")
+    
     for epoch in range(start_epoch, args.epochs):
         logger.info(f"Beginning epoch {epoch}...")
         loader.sampler.set_epoch(epoch)
@@ -342,17 +361,20 @@ def main(args):
 
             # Save Checkpoint
             if train_steps % args.ckpt_every == 0 and train_steps > 0:
+                ckpt_cycle_count += 1
+                
                 if rank == 0:
                     checkpoint = {
                         "controlnet": model.module.controlnet.state_dict(),
                         "opt": opt.state_dict(),
+                        "scaler": scaler.state_dict(),  # Save scaler state for AMP
                         "args": args,
                         "epoch": epoch,
                         "train_steps": train_steps
                     }
                     checkpoint_path = f"{checkpoint_dir}/{train_steps:07d}.pt"
                     torch.save(checkpoint, checkpoint_path)
-                    logger.info(f"Saved checkpoint to {checkpoint_path}")
+                    logger.info(f"Saved checkpoint to {checkpoint_path} (including optimizer and scaler states)")
                     
                     # Validation Sampling
                     if args.AE_ckpt is not None and device == 1:
@@ -371,11 +393,11 @@ def main(args):
                             
                             # Create control sample
                             if args.use_noisy_latent_control:
-                                # For inference, use the clean z_sample as "reference" with zero noise
+                                # For inference without latent, use zeros for latent channels
                                 control_sample = torch.zeros((1, control_channels, volume_size[0], volume_size[1], volume_size[2]), device=device)
                                 control_sample[:, 0] = 0.5  # Age 0.5
                                 control_sample[:, 1] = 0.0  # Sex 0
-                                control_sample[:, 2:] = z_sample  # Use the initial noise as "noisy latent"
+                                # control_sample[:, 2:] is already zeros, no need to modify
                             else:
                                 control_sample = torch.zeros((1, 2, volume_size[0], volume_size[1], volume_size[2]), device=device)
                                 control_sample[:, 0] = 0.5  # Age 0.5
@@ -394,6 +416,21 @@ def main(args):
                             tio.ScalarImage(tensor=volume).save(volume_path)
                 
                 dist.barrier()
+                
+                # Check if we've reached the target number of checkpoint cycles
+                if ckpt_cycles is not None and ckpt_cycle_count >= ckpt_cycles:
+                    logger.info(f"Reached target checkpoint cycles ({ckpt_cycles}). Stopping training.")
+                    # Clear VRAM
+                    del model
+                    del controlnet
+                    del base_model
+                    del diffusion
+                    del opt
+                    if AE is not None:
+                        del AE
+                    torch.cuda.empty_cache()
+                    cleanup()
+                    return
 
     cleanup()
 
@@ -432,6 +469,10 @@ if __name__ == "__main__":
                         help="Maximum noise strength for noisy latent control")
     parser.add_argument("--verify-data", action='store_true',
                         help="Verify data shapes and values before training")
+    parser.add_argument("--full-noise-prob", type=float, default=0.0,
+                        help="Probability of using full noise instead of noisy latent (0.0-1.0)")
+    parser.add_argument("--ckpt-cycles", type=int, default=None,
+                        help="Number of checkpoint cycles to train before stopping (None = train for full epochs)")
     args = parser.parse_args()
     main(args)
 

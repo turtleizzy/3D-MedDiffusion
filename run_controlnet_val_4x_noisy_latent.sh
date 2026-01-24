@@ -12,12 +12,12 @@ source .venv/bin/activate
 #   4. With custom noise strength: bash run_controlnet_val_4x_noisy_latent.sh --input-nifti /path/to/input.nii.gz --noise-strength 0.3
 
 # Default values
-CONTROL_CKPT="results/controlnet_train_4x_noisy_latent/004-ControlNet_NoisyLatent/checkpoints/0045000.pt"
-OUTPUT_DIR="results/inference_controlnet_4x_noisy_latent"
-AGE=0.2
+CONTROL_CKPT="results/controlnet_train_4x_augmented_alternating/001-ControlNet_NoisyLatent/checkpoints/0005000.pt"
+OUTPUT_DIR="results/inference_controlnet_4x_noisy_latent_alternating_ckpt5000"
+AGE=0.8
 SEX=0.0
 NOISE_STRENGTH=0.5
-INPUT_NIFTI="data/UCSD-PTGBM/T1Pre/UCSD-PTGBM-0002_01_T1pre.nii.gz"
+INPUT_NIFTI= #"data/UCSD-PTGBM/T1Pre/UCSD-PTGBM-0002_01_T1pre.nii.gz"
 
 .venv/bin/python inference_ControlNet.py \
   --base-ckpt checkpoints/BiFlowNet_4x.pt \
@@ -32,7 +32,7 @@ INPUT_NIFTI="data/UCSD-PTGBM/T1Pre/UCSD-PTGBM-0002_01_T1pre.nii.gz"
   --timesteps 1000 \
   --downsample-factor 4 \
   --use-noisy-latent-control \
-  --input-nifti ${INPUT_NIFTI} \
-  --noise-strength ${NOISE_STRENGTH} \
-  "$@"
+  # --input-nifti ${INPUT_NIFTI} \
+  # --noise-strength ${NOISE_STRENGTH} \
+  # "$@"
 
