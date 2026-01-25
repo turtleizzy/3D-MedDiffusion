@@ -11,7 +11,7 @@ source .venv/bin/activate
 DATA_PATH="data/skullstrip/index.json"
 LATENT_ROOT="data/skullstrip/latents_4x_augmented"
 AE_CKPT="checkpoints/PatchVolume4x_s2.ckpt"
-RESULTS_DIR="results/controlnet_train_4x_augmented_alternating"
+RESULTS_DIR="results/controlnet_train_4x_augmented_alternating_fixed_latent"
 PRETRAINED_BASE_CKPT="checkpoints/BiFlowNet_4x.pt"
 RESOLUTION="48 48 48"
 DOWNSAMPLE_FACTOR=4
@@ -30,6 +30,12 @@ VOLUME_CHANNELS=8
 EPOCHS=300
 LOG_EVERY=5
 FULL_NOISE_PROB=0.5  # 50% probability of using full noise
+
+# Validation parameters
+VAL_DIR="data/validation"  # Directory containing .nii.gz files for validation
+VAL_SEX=0.0
+VAL_NOISE_STRENGTH=0.5
+VAL_AGES="0.2 0.8"  # Age values to test for each file
 
 # Create directories
 mkdir -p "${LATENT_ROOT}"
@@ -143,17 +149,11 @@ while [ $CYCLE -lt $MAX_CYCLES ]; do
         VAL_OUTPUT_DIR="${RESULTS_DIR}/validation_cycle${CYCLE}"
         mkdir -p "${VAL_OUTPUT_DIR}"
         
-        # Validation parameters
-        VAL_NIFTI="data/UCSD-PTGBM/UCSD-PTGBM-0166_01_T1pre_masked.nii.gz"
-        VAL_SEX=0.0
-        VAL_NOISE_STRENGTH=0.5
-        
         # Build base inference command
         INFERENCE_CMD=".venv/bin/python inference_ControlNet.py"
         INFERENCE_CMD="${INFERENCE_CMD} --base-ckpt ${PRETRAINED_BASE_CKPT}"
         INFERENCE_CMD="${INFERENCE_CMD} --control-ckpt \"${LATEST_CKPT}\""
         INFERENCE_CMD="${INFERENCE_CMD} --ae-ckpt ${AE_CKPT}"
-        INFERENCE_CMD="${INFERENCE_CMD} --output-dir ${VAL_OUTPUT_DIR}"
         INFERENCE_CMD="${INFERENCE_CMD} --modality T1"
         INFERENCE_CMD="${INFERENCE_CMD} --sex ${VAL_SEX}"
         INFERENCE_CMD="${INFERENCE_CMD} --resolution ${RESOLUTION}"
@@ -167,36 +167,121 @@ while [ $CYCLE -lt $MAX_CYCLES ]; do
         INFERENCE_CMD="${INFERENCE_CMD} --use-attn ${USE_ATTN}"
         INFERENCE_CMD="${INFERENCE_CMD} --noise-strength ${VAL_NOISE_STRENGTH}"
         
-        # Run 4 validation cases
-        echo "Running validation case 1/4: No nifti, age=0.2"
-        eval ${INFERENCE_CMD} --age 0.2
-        
-        if [ $? -ne 0 ]; then
-            echo "Warning: Validation case 1 failed."
+        # Scan validation directory for all .nii.gz files
+        if [ ! -d "${VAL_DIR}" ]; then
+            echo "Warning: Validation directory ${VAL_DIR} does not exist. Skipping validation."
+        else
+            # Find all .nii.gz files in the validation directory
+            VAL_FILES=$(find "${VAL_DIR}" -name "*.nii.gz" -type f | sort)
+            
+            # Count files (handle empty result)
+            if [ -z "${VAL_FILES}" ]; then
+                VAL_FILE_COUNT=0
+            else
+                VAL_FILE_COUNT=$(echo "${VAL_FILES}" | grep -c .)
+            fi
+            
+            if [ "${VAL_FILE_COUNT}" -eq 0 ]; then
+                echo "Warning: No .nii.gz files found in ${VAL_DIR}. Skipping validation."
+            else
+                echo "Found ${VAL_FILE_COUNT} .nii.gz files in ${VAL_DIR}"
+                
+                # Count number of age values
+                AGE_COUNT=0
+                for age in ${VAL_AGES}; do
+                    AGE_COUNT=$((AGE_COUNT + 1))
+                done
+                
+                # Calculate total cases: files with latent + cases without latent
+                CASES_WITH_LATENT=$((VAL_FILE_COUNT * AGE_COUNT))
+                CASES_WITHOUT_LATENT=${AGE_COUNT}  # One case per age value without latent
+                TOTAL_CASES=$((CASES_WITH_LATENT + CASES_WITHOUT_LATENT))
+                
+                echo "Generating predictions:"
+                echo "  - ${CASES_WITH_LATENT} cases with latent input (${VAL_FILE_COUNT} files × ${AGE_COUNT} ages)"
+                echo "  - ${CASES_WITHOUT_LATENT} cases without latent input (${AGE_COUNT} ages)"
+                echo "  Total: ${TOTAL_CASES} cases"
+                
+                FILE_INDEX=0
+                CURRENT_CASE=0
+                
+                # Process each file
+                while IFS= read -r VAL_NIFTI; do
+                    if [ -z "${VAL_NIFTI}" ]; then
+                        continue
+                    fi
+                    
+                    FILE_INDEX=$((FILE_INDEX + 1))
+                    FILENAME=$(basename "${VAL_NIFTI}" .nii.gz)
+                    
+                    # Create per-file output directory
+                    FILE_OUTPUT_DIR="${VAL_OUTPUT_DIR}/${FILENAME}"
+                    mkdir -p "${FILE_OUTPUT_DIR}"
+                    
+                    # Generate predictions for each age value
+                    for VAL_AGE in ${VAL_AGES}; do
+                        CURRENT_CASE=$((CURRENT_CASE + 1))
+                        echo ""
+                        echo "Running validation case ${CURRENT_CASE}/${TOTAL_CASES}:"
+                        echo "  File: ${FILENAME} (${FILE_INDEX}/${VAL_FILE_COUNT})"
+                        echo "  Age: ${VAL_AGE}"
+                        
+                        # Build command for this specific case
+                        CASE_CMD="${INFERENCE_CMD}"
+                        CASE_CMD="${CASE_CMD} --output-dir ${FILE_OUTPUT_DIR}"
+                        CASE_CMD="${CASE_CMD} --age ${VAL_AGE}"
+                        CASE_CMD="${CASE_CMD} --input-nifti \"${VAL_NIFTI}\""
+                        
+                        # Execute inference
+                        eval ${CASE_CMD}
+                        
+                        if [ $? -ne 0 ]; then
+                            echo "Warning: Validation failed for ${FILENAME} with age=${VAL_AGE}"
+                        else
+                            echo "Successfully generated prediction for ${FILENAME} with age=${VAL_AGE}"
+                        fi
+                    done
+                done <<< "${VAL_FILES}"
+                
+                # Generate predictions without latent input
+                echo ""
+                echo "=========================================="
+                echo "Generating predictions without latent input"
+                echo "=========================================="
+                
+                NO_LATENT_OUTPUT_DIR="${VAL_OUTPUT_DIR}/no_latent_input"
+                mkdir -p "${NO_LATENT_OUTPUT_DIR}"
+                
+                for VAL_AGE in ${VAL_AGES}; do
+                    CURRENT_CASE=$((CURRENT_CASE + 1))
+                    echo ""
+                    echo "Running validation case ${CURRENT_CASE}/${TOTAL_CASES}:"
+                    echo "  No latent input"
+                    echo "  Age: ${VAL_AGE}"
+                    
+                    # Build command without input-nifti
+                    CASE_CMD="${INFERENCE_CMD}"
+                    CASE_CMD="${CASE_CMD} --output-dir ${NO_LATENT_OUTPUT_DIR}"
+                    CASE_CMD="${CASE_CMD} --age ${VAL_AGE}"
+                    # Note: No --input-nifti flag, so no latent input
+                    
+                    # Execute inference
+                    eval ${CASE_CMD}
+                    
+                    if [ $? -ne 0 ]; then
+                        echo "Warning: Validation failed for no latent input with age=${VAL_AGE}"
+                    else
+                        echo "Successfully generated prediction without latent input for age=${VAL_AGE}"
+                    fi
+                done
+                
+                echo ""
+                echo "Validation completed."
+                echo "  - Processed ${FILE_INDEX} files with latent input (${AGE_COUNT} age values each)"
+                echo "  - Generated ${CASES_WITHOUT_LATENT} predictions without latent input"
+                echo "Results saved to ${VAL_OUTPUT_DIR}"
+            fi
         fi
-        
-        echo "Running validation case 2/4: No nifti, age=0.8"
-        eval ${INFERENCE_CMD} --age 0.8
-        
-        if [ $? -ne 0 ]; then
-            echo "Warning: Validation case 2 failed."
-        fi
-        
-        echo "Running validation case 3/4: With nifti, age=0.2"
-        eval ${INFERENCE_CMD} --age 0.2 --input-nifti "${VAL_NIFTI}"
-        
-        if [ $? -ne 0 ]; then
-            echo "Warning: Validation case 3 failed."
-        fi
-        
-        echo "Running validation case 4/4: With nifti, age=0.8"
-        eval ${INFERENCE_CMD} --age 0.8 --input-nifti "${VAL_NIFTI}"
-        
-        if [ $? -ne 0 ]; then
-            echo "Warning: Validation case 4 failed."
-        fi
-        
-        echo "Validation completed. Results saved to ${VAL_OUTPUT_DIR}"
     else
         echo "Warning: No checkpoint found. Will start from scratch in next cycle."
         CURRENT_CKPT=""

@@ -24,7 +24,7 @@ import copy
 from torch.cuda.amp import autocast, GradScaler
 import random
 from torch.optim.lr_scheduler import StepLR
-from dataset.Control_dataset import Control_dataset
+from dataset.Control_dataset import Control_dataset, LatentLoadError
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
@@ -316,48 +316,94 @@ def main(args):
     if ckpt_cycles is not None:
         logger.info(f"Will train for {ckpt_cycles} checkpoint cycles (every {args.ckpt_every} steps)")
     
+    # Track skipped samples due to errors
+    skipped_samples = 0
+    error_log_interval = 100  # Log errors every N skipped samples
+    
     for epoch in range(start_epoch, args.epochs):
         logger.info(f"Beginning epoch {epoch}...")
         loader.sampler.set_epoch(epoch)
-        for z, y, res, control in loader:
-            b = z.shape[0]
-            z = z.to(device)
-            y = y.to(device)
-            res = res.to(device)
-            control = control.to(device)
-            
-            # Encode raw images to latents if AE is available
-            if AE is not None:
-                with torch.no_grad():
-                    embeddings, _ = AE.encode(z, include_embeddings=True, quantize=True)
-                    # Normalize embeddings to [-1, 1]
-                    min_val = AE.codebook.embeddings.min()
-                    max_val = AE.codebook.embeddings.max()
-                    z = (embeddings - min_val) / (max_val - min_val) * 2.0 - 1.0
-            
-            with autocast(enabled=amp):
-                t = torch.randint(0, diffusion.num_timesteps, (b,), device=device)
-                # Pass control as hint
-                loss = diffusion.p_losses(model, z, t, y=y, res=res, hint=control)
+        
+        for batch_idx, batch_data in enumerate(loader):
+            try:
+                z, y, res, control = batch_data
                 
-                scaler.scale(loss).backward()
+                # Validate batch shapes before processing
+                b = z.shape[0]
+                expected_z_shape = (b, args.volume_channels, args.resolution[0], args.resolution[1], args.resolution[2])
+                expected_control_shape = (b, control_channels, args.resolution[0], args.resolution[1], args.resolution[2])
+                
+                if z.shape != expected_z_shape:
+                    raise ValueError(
+                        f"Latent shape mismatch in batch: expected {expected_z_shape}, got {z.shape}"
+                    )
+                if control.shape != expected_control_shape:
+                    raise ValueError(
+                        f"Control shape mismatch in batch: expected {expected_control_shape}, got {control.shape}"
+                    )
+                
+                z = z.to(device)
+                y = y.to(device)
+                res = res.to(device)
+                control = control.to(device)
+                
+                # Encode raw images to latents if AE is available
+                if AE is not None:
+                    with torch.no_grad():
+                        embeddings, _ = AE.encode(z, include_embeddings=True, quantize=True)
+                        # Normalize embeddings to [-1, 1]
+                        min_val = AE.codebook.embeddings.min()
+                        max_val = AE.codebook.embeddings.max()
+                        z = (embeddings - min_val) / (max_val - min_val) * 2.0 - 1.0
+                
+                with autocast(enabled=amp):
+                    t = torch.randint(0, diffusion.num_timesteps, (b,), device=device)
+                    # Pass control as hint
+                    loss = diffusion.p_losses(model, z, t, y=y, res=res, hint=control)
+                    
+                    scaler.scale(loss).backward()
 
-            scaler.step(opt)
-            scaler.update()
-            opt.zero_grad()          
+                scaler.step(opt)
+                scaler.update()
+                opt.zero_grad()          
 
-            running_loss += loss.item()
-            log_steps += 1
-            train_steps += 1
+                running_loss += loss.item()
+                log_steps += 1
+                train_steps += 1
 
-            if train_steps % args.log_every == 0:
-                torch.cuda.synchronize()
-                avg_loss = torch.tensor(running_loss / log_steps, device=device)
-                dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
-                avg_loss = avg_loss.item() / dist.get_world_size()
-                logger.info(f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}")
-                running_loss = 0
-                log_steps = 0
+                if train_steps % args.log_every == 0:
+                    torch.cuda.synchronize()
+                    avg_loss = torch.tensor(running_loss / log_steps, device=device)
+                    dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
+                    avg_loss = avg_loss.item() / dist.get_world_size()
+                    logger.info(f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}")
+                    if skipped_samples > 0:
+                        logger.info(f"Total skipped samples so far: {skipped_samples}")
+                    running_loss = 0
+                    log_steps = 0
+                    
+            except (LatentLoadError, ValueError, RuntimeError, FileNotFoundError) as e:
+                # Skip this batch and continue training
+                skipped_samples += 1
+                if skipped_samples % error_log_interval == 0 or skipped_samples == 1:
+                    logger.warning(
+                        f"Skipped batch {batch_idx} in epoch {epoch} due to error (total skipped: {skipped_samples}): {str(e)}"
+                    )
+                # Clear any gradients that might have been computed
+                opt.zero_grad()
+                # Clear CUDA cache to recover from potential memory issues
+                torch.cuda.empty_cache()
+                continue
+            except Exception as e:
+                # For unexpected errors, log and skip
+                skipped_samples += 1
+                logger.error(
+                    f"Unexpected error during training at batch {batch_idx} in epoch {epoch} (skipped: {skipped_samples}): {str(e)}",
+                    exc_info=True
+                )
+                opt.zero_grad()
+                torch.cuda.empty_cache()
+                continue
 
             # Save Checkpoint
             if train_steps % args.ckpt_every == 0 and train_steps > 0:

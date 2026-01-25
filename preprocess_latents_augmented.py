@@ -238,12 +238,9 @@ def main(args):
             data = data.transpose(1, 3)  # (C, D, H, W)
             
             # Move to GPU
-            x = data.unsqueeze(0).to(device)  # (1, C, D, H, W)
+            # x = data.unsqueeze(0).to(device)  # (1, C, D, H, W)
             t_transfer = time.time() - t0
             timings['transfer_to_gpu'].append(t_transfer)
-            
-            # First, encode original without augmentation (if needed)
-            # But we want augmented versions, so skip original
             
             # Pre-compute normalization values once
             with torch.no_grad():
@@ -255,8 +252,36 @@ def main(args):
                 vis_dir = os.path.join(args.output_dir, 'visualizations', stem)
                 os.makedirs(vis_dir, exist_ok=True)
                 # Use unified visualization function
-                visualize_slice(x, f'Original: {stem}', 
+                visualize_slice(data.unsqueeze(0), f'Original: {stem}', 
                                os.path.join(vis_dir, 'original.jpg'), rank)
+            
+            # First, encode and save original without augmentation
+            t0 = time.time()
+            original_latent_path = os.path.join(args.output_dir, f"{stem}.pt")
+            
+            # Skip if file already exists (unless force is set)
+            if os.path.exists(original_latent_path) and not getattr(args, 'overwrite', False):
+                if rank == 0:
+                    print(f"Skipping {stem}.pt - original latent already exists. Use --overwrite to regenerate.")
+            else:
+                with torch.no_grad():
+                    with torch.cuda.amp.autocast():
+                        x_original = data.unsqueeze(0).to(device).transpose(3, 4)  # (1, C, D, H, W) -> (1, C, D, W, H)
+                        # requirement for AE: (1, C, D, W, H) according to Singleres_dataset.py
+                        embeddings, _ = AE.encode(x_original, include_embeddings=True, quantize=True)
+                        del x_original
+
+                    # Normalize (using pre-computed values)
+                    z_original = (embeddings - min_val) / (max_val - min_val) * 2.0 - 1.0
+                    z_original_cpu = z_original.squeeze(0).cpu()
+
+                    del embeddings
+                    del z_original
+
+                # Use faster save (no compression)
+                torch.save(z_original_cpu, original_latent_path, _use_new_zipfile_serialization=False)
+                t_save_original = time.time() - t0
+                timings['save_original'].append(t_save_original)
             
             # Generate num_augmentations augmented versions
             for aug_idx in range(args.num_augmentations):
@@ -300,14 +325,15 @@ def main(args):
                 # IMPORTANT: Re-apply CropOrPad to ensure correct dimensions after augmentation
                 # Some augmentations (like elastic deformation) may change the spatial dimensions
                 # Convert back to torchio format for CropOrPad
+                
                 subject_aug = tio.Subject(image=tio.ScalarImage(tensor=x_aug))
                 subject_aug = crop_or_pad_transform(subject_aug)  # Re-apply CropOrPad to target_image_size
-                x_aug = subject_aug['image'].data  # (C, W, H, D) on CPU
+                x_aug = subject_aug['image'].data.transpose(1, 3)  # (C, W, H, D) on CPU
                 
                 # transpose(1, 3) swaps W and D: (C, W, H, D) -> (C, D, H, W)
                 x_aug = x_aug.transpose(1, 3)  # (C, D, H, W)
                 
-                x_aug = x_aug.unsqueeze(0).to(device)  # (1, C, D, H, W) on GPU
+                x_aug = x_aug.unsqueeze(0)#.to(device)  # (1, C, D, H, W) on GPU
                 t_format_conv2 = time.time() - t0
                 timings['format_convert_gpu'].append(t_format_conv2)
                 
@@ -317,7 +343,11 @@ def main(args):
                     x_aug = apply_patch_augmentations(x_aug.squeeze(0), p_blur=0.5, p_delete=0.3).unsqueeze(0)
                 t_patch_aug = time.time() - t0
                 timings['patch_augmentations'].append(t_patch_aug)
-                
+                x_aug_tio = x_aug.squeeze(0).transpose(1, 3)
+                subject_aug = tio.Subject(image=tio.ScalarImage(tensor=x_aug_tio))
+                subject_aug = crop_or_pad_transform(subject_aug)  # Re-apply CropOrPad to target_image_size
+                x_aug = subject_aug['image'].data.transpose(1, 3).unsqueeze(0)  # (C, D, H, W) on CPU after transpose
+
                 # Save augmented image for visualization if enabled
                 # Use unified visualization function to ensure consistency
                 if getattr(args, 'save_visualization', False):
@@ -329,7 +359,7 @@ def main(args):
                 # Encode to latent
                 with torch.no_grad():
                     with torch.cuda.amp.autocast():
-                        x_aug = x_aug.transpose(3, 4)  # (1, C, D, H, W) -> (1, C, D, W, H)
+                        x_aug = x_aug.transpose(3, 4).to(device)  # (1, C, D, H, W) -> (1, C, D, W, H)
                         # requirement for AE: (1, C, D, W, H) according to Singleres_dataset.py
                         embeddings, _ = AE.encode(x_aug, include_embeddings=True, quantize=True)
                     
@@ -376,8 +406,6 @@ def main(args):
                             print(f"  {step_name:25s}: avg={avg_time*1000:6.2f}ms, total={total_time:6.2f}s (n={len(recent_times)})")
                 print()
             
-            # Clear original
-            del x
             
         except Exception as e:
             print(f"Error processing {path}: {e}")

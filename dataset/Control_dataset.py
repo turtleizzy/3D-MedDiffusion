@@ -6,6 +6,11 @@ import os
 import glob
 import torchio as tio
 
+
+class LatentLoadError(Exception):
+    """Custom exception for latent loading errors."""
+    pass
+
 class Control_dataset(Singleres_dataset):
     def __init__(self, root_dir=None, resolution=[32,32,32], generate_latents=False, 
                  downsample_factor=8, latent_root=None, volume_channels=8,
@@ -101,75 +106,91 @@ class Control_dataset(Singleres_dataset):
         age = age / 100.0
         
         D, H, W = self.resolution
-        
+        original_name = os.path.basename(path)
+        stem = original_name.replace('.nii.gz', '').replace('.nii', '')
+
         if self.latent_root is not None:
             # Load pre-computed latent
-            original_name = os.path.basename(path)
-            stem = original_name.replace('.nii.gz', '').replace('.nii', '')
-            
+
             # First try to find original latent
             latent_path = os.path.join(self.latent_root, f"{stem}.pt")
             
-            # If original not found, try to find augmented versions
             if not os.path.exists(latent_path):
-                # Look for augmented latents: {stem}_aug*.pt
-                aug_pattern = os.path.join(self.latent_root, f"{stem}_aug*.pt")
-                aug_files = glob.glob(aug_pattern)
-                
-                if len(aug_files) > 0:
-                    # Randomly select one augmented version
-                    latent_path = np.random.choice(aug_files)
-                else:
-                    raise FileNotFoundError(f"Latent file not found: {latent_path} (also checked augmented versions)")
-            else:
-                # Original exists, but if augmented versions also exist, randomly choose between original and augmented
-                aug_pattern = os.path.join(self.latent_root, f"{stem}_aug*.pt")
-                aug_files = glob.glob(aug_pattern)
-                
-                if len(aug_files) > 0:
-                    # Randomly choose between original and augmented versions
-                    all_options = [latent_path] + aug_files
-                    latent_path = np.random.choice(all_options)
-                
-            data = torch.load(latent_path)
-            # data is (C, D, H, W). For 4x model (volume_channels, 48, 48, 48)
+                raise LatentLoadError(f"Latent file not found: {latent_path}")
             
-            # Verify and fix dimensions if needed
-            expected_shape = (self.volume_channels, self.resolution[0], self.resolution[1], self.resolution[2])
+            # Load original latent with error handling
+            try:
+                data_original = torch.load(latent_path, map_location='cpu')
+            except Exception as e:
+                raise LatentLoadError(f"Failed to load latent file {latent_path}: {str(e)}")
+            
+            # Validate original latent shape
+            expected_shape = (self.volume_channels, D, H, W)
+            if data_original.shape != expected_shape:
+                raise LatentLoadError(
+                    f"Original latent shape mismatch for {latent_path}: "
+                    f"expected {expected_shape}, got {data_original.shape}"
+                )
+            
+            # Look for augmented latents: {stem}_aug*.pt
+            aug_pattern = os.path.join(self.latent_root, f"{stem}_aug*.pt")
+            aug_files = glob.glob(aug_pattern)
+            all_options = [latent_path] + aug_files
+            
+            if len(all_options) == 0:
+                raise LatentLoadError(f"No latent files found for {stem}")
+            
+            # Randomly select one augmented version
+            augmented_latent_path = np.random.choice(all_options)
+            
+            # Load augmented latent with error handling
+            try:
+                data = torch.load(augmented_latent_path, map_location='cpu')
+            except Exception as e:
+                raise LatentLoadError(
+                    f"Failed to load augmented latent file {augmented_latent_path}: {str(e)}"
+                )
+            
+            # Validate augmented latent shape
             if data.shape != expected_shape:
-                # Resize to expected shape using interpolation
-                from torch.nn.functional import interpolate
-                data = data.unsqueeze(0)  # (1, C, D, H, W)
-                data = interpolate(data, size=self.resolution, mode='trilinear', align_corners=False)
-                data = data.squeeze(0)  # (C, D, H, W)
+                raise LatentLoadError(
+                    f"Augmented latent shape mismatch for {augmented_latent_path}: "
+                    f"expected {expected_shape}, got {data.shape}"
+                )
             
+            # Ensure data is float32
+            if data.dtype != torch.float32:
+                data = data.to(torch.float32)
+            if data_original.dtype != torch.float32:
+                data_original = data_original.to(torch.float32)
+
             # Create control tensor
             control = self._create_control(age, sex, data)
             
-            return data, torch.tensor(cls_idx), torch.tensor(self.resolution)/64.0, control
-        
-        # Load raw image
-        img = tio.ScalarImage(path)
-        img = self.transform(img)
-        data = img.data.to(torch.float32)
-        
-        # Normalize to [-1, 1]
-        d_min = data.min()
-        d_max = data.max()
-        if d_max > d_min:
-            data = (data - d_min) / (d_max - d_min) * 2.0 - 1.0
+            return data_original, torch.tensor(cls_idx), torch.tensor(self.resolution)/64.0, control
         else:
-            data = torch.zeros_like(data)
+            # Load raw image
+            img = tio.ScalarImage(path)
+            img = self.transform(img)
+            data = img.data.to(torch.float32)
             
-        # Transpose dimensions to match AE expectation (C, D, H, W)
-        # Assuming input is (C, W, H, D) from tio
-        data = data.transpose(1,3).transpose(2,3)
-        
-        # For raw images, we can't create noisy latent control without AE
-        # Create basic control with age/sex only
-        control = self._create_control(age, sex, None)
-        
-        return data, torch.tensor(cls_idx), torch.tensor(self.resolution)/64.0, control
+            # Normalize to [-1, 1]
+            d_min = data.min()
+            d_max = data.max()
+            if d_max > d_min:
+                data = (data - d_min) / (d_max - d_min) * 2.0 - 1.0
+            else:
+                data = torch.zeros_like(data)
+                
+            # Transpose dimensions to match AE expectation (C, D, H, W)
+            # Assuming input is (C, W, H, D) from tio
+            data = data.transpose(1,3).transpose(2,3)
+            
+            # For raw images, we can't create noisy latent control without AE
+            # Create basic control with age/sex only
+            control = self._create_control(age, sex, None)
+            
+            return data, torch.tensor(cls_idx), torch.tensor(self.resolution)/64.0, control
     
     def _create_control(self, age, sex, latent=None):
         """
@@ -195,6 +216,14 @@ class Control_dataset(Singleres_dataset):
             control[1] = sex
             
             if latent is not None:
+                # Validate latent shape
+                expected_latent_shape = (self.volume_channels, D, H, W)
+                if latent.shape != expected_latent_shape:
+                    raise LatentLoadError(
+                        f"Latent shape mismatch in _create_control: "
+                        f"expected {expected_latent_shape}, got {latent.shape}"
+                    )
+                
                 # With full_noise_prob probability, use zeros instead of noisy latent
                 if torch.rand(1).item() < self.full_noise_prob:
                     # Use zeros for latent channels
